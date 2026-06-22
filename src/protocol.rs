@@ -38,19 +38,9 @@ pub fn decode_chunk(bs: Bytes) -> Result<Chunk, SyncError> {
         ));
     }
 
-    let offset_bs = &bs[0..8];
-    let hash: &[u8] = &bs[8..40];
-    let mut ck_hash = [0u8; 32];
-    ck_hash.copy_from_slice(hash);
+    let offset = u64::from_be_bytes(bs[..8].try_into().unwrap());
+    let hash = ChunkHash::from_slice(&bs[8..40]);
 
-    let d = &bs[40..];
-    let data_vec = d.to_vec();
-    let data = Bytes::from(data_vec);
-
-    let offset_arr = offset_bs
-        .try_into()
-        .map_err(|e: TryFromSliceError| SyncError::StdIOError(e.to_string()))?;
-    let chunk =
-        Chunk::with_offset(data, u64::from_be_bytes(offset_arr)).set_hash(ChunkHash::new(ck_hash));
-    Ok(chunk)
+    let data = Bytes::from(bs.slice(40..));
+    Ok(Chunk::with_offset(data, offset).set_hash(hash.unwrap()))
 }
