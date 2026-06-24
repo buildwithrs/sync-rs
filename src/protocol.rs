@@ -23,6 +23,13 @@ pub trait SyncRecvStream {
 }
 
 #[derive(Debug, Clone)]
+pub enum FileUploadState {
+    Init,
+    Uploading,
+    Done
+}
+
+#[derive(Debug, Clone)]
 pub struct FileMeta {
     pub file_id: Uuid,
     pub file_path: PathBuf,
@@ -67,6 +74,8 @@ impl FileMeta {
 
 pub const UPLOAD_INIT_TAG: u8 = 0x01;
 pub const CHUNK_TAG: u8 = 0x03;
+pub const UPLOAD_DONE_TAG: u8 = 0x05;
+pub const ERR_TAG: u8 = 0xFF;
 
 #[derive(Debug)]
 pub struct UploadInitEvent {
@@ -83,6 +92,17 @@ pub struct ChunkEvent {
     pub data: Bytes,
 }
 
+#[derive(Debug)]
+pub struct ErrMsg {
+    pub code: u8,
+    pub msg: String,
+}
+
+#[derive(Debug)]
+pub struct UploadDoneEvent {
+    pub file_id: Uuid,
+}
+
 pub fn new_framed_writer(
     stream: OwnedWriteHalf,
 ) -> FramedWrite<OwnedWriteHalf, LengthDelimitedCodec> {
@@ -93,6 +113,51 @@ pub fn new_framed_reader(
     stream: OwnedReadHalf,
 ) -> FramedRead<OwnedReadHalf, LengthDelimitedCodec> {
     FramedRead::new(stream, LengthDelimitedCodec::default())
+}
+
+/// tag | file_id
+pub fn encode_upload_done(d: UploadDoneEvent) -> BytesMut {
+    let mut encode_bs = BytesMut::with_capacity(100);
+    encode_bs.put_u8(UPLOAD_DONE_TAG); // 1 byte
+    encode_bs.put_slice(&d.file_id.into_bytes()); // variable length
+    encode_bs
+}
+
+/// tag(1) | file_id(16)
+pub fn decode_upload_done(bs: &mut BytesMut) -> Result<UploadDoneEvent, SyncError> {
+    if bs.len() < 16 {
+        return Err(SyncError::BadChunkData(
+            "chunk length must >= 16".to_string(),
+        ));
+    }
+
+    let file_id = String::from_utf8_lossy(&bs[..16]);
+    Ok(UploadDoneEvent { file_id: uuid::Uuid::parse_str(&file_id)? })
+}
+
+
+/// err_tag | code(1) | msg
+pub fn encode_error(err_msg: ErrMsg) -> BytesMut {
+    let mut encode_bs = BytesMut::with_capacity(100);
+    encode_bs.put_u8(ERR_TAG); // 1 byte
+
+    encode_bs.put_u8(err_msg.code); // 1 byte
+    encode_bs.put_slice(&err_msg.msg.into_bytes()); // variable length
+    encode_bs
+}
+
+/// code(1) | msg
+pub fn decode_error(bs: &mut BytesMut) -> Result<ErrMsg, SyncError> {
+   if bs.len() <= 1 {
+        return Err(SyncError::BadChunkData(
+            "chunk length must > 1".to_string(),
+        ));
+    }
+
+    let code = u8::from_be_bytes(bs[..1].try_into().unwrap());
+    let msg = String::from_utf8_lossy(&bs[1..]);
+
+    Ok(ErrMsg { code, msg: msg.to_string() })
 }
 
 pub fn encode_chunk(chunk: Chunk) -> BytesMut {

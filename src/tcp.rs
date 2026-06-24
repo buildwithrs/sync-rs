@@ -21,9 +21,9 @@ use uuid::Uuid;
 use crate::{
     errors::SyncError,
     protocol::{
-        CHUNK_TAG, ChunkEvent, FileMeta, UPLOAD_INIT_TAG, UploadInitEvent, decode_chunk_event,
-        decode_upload_init, encode_chunk_event, encode_upload_init, new_framed_reader,
-        new_framed_writer,
+        CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_INIT_TAG, UploadDoneEvent,
+        UploadInitEvent, decode_chunk_event, decode_upload_init, encode_chunk_event,
+        encode_upload_done, encode_upload_init, new_framed_reader, new_framed_writer,
     },
 };
 
@@ -118,17 +118,35 @@ impl ClientFileProcessor {
             name: name.to_string(),
         };
 
-        tokio::spawn(async move {
-            let upload_bs = encode_upload_init(upload_event);
+        let done_event = UploadDoneEvent {
+            file_id: f_meta.file_id,
+        };
 
-            let _ = framed_writer.send(Bytes::from(upload_bs)).await;
+        // Writer task: owns `rx` and the framed writer.
+        // Drains every chunk, then writes the done event.
+        let writer_handle = tokio::spawn(async move {
+            let upload_bs = encode_upload_init(upload_event);
+            if let Err(e) = framed_writer.send(Bytes::from(upload_bs)).await {
+                warn!("send upload init failed: {}", e);
+                return Err(SyncError::from(e));
+            }
 
             while let Some(data) = rx.recv().await {
                 if let Err(e) = framed_writer.send(data).await {
                     warn!("failed to write chunk to TCP Stream: {}", e);
-                    break;
+                    return Err(SyncError::from(e));
                 }
             }
+
+            if let Err(e) = framed_writer
+                .send(Bytes::from(encode_upload_done(done_event)))
+                .await
+            {
+                warn!("failed to write done_event: {}", e);
+                return Err(SyncError::from(e));
+            }
+
+            Ok::<(), SyncError>(())
         });
 
         let mut join_set = JoinSet::new();
@@ -139,16 +157,20 @@ impl ClientFileProcessor {
 
             let tx_c = tx.clone();
             join_set.spawn(async move {
-                let bs = encode_chunk_event(chunk);
-                tx_c.send(bs.into())
+                tx_c.send(encode_chunk_event(chunk).into())
                     .await
                     .expect("failed to send item to write channel")
             });
         }
 
+        // Drop the original sender so the receiver can finish once every clone is gone.
+        drop(tx);
+
         while let Some(r) = join_set.join_next().await {
             r.expect("sending chunk task failed");
         }
+
+        writer_handle.await.expect("writer task panicked")?;
         Ok(())
     }
 }
@@ -156,6 +178,7 @@ impl ClientFileProcessor {
 #[derive(Debug)]
 pub struct ServerFileProcessor {
     pub file_dict: Arc<RwLock<HashMap<Uuid, FileMeta>>>,
+    pub file_state: Arc<RwLock<HashMap<Uuid, FileUploadState>>>,
 }
 
 impl ServerFileProcessor {
