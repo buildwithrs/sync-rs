@@ -1,9 +1,11 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
-use blake3::hazmat::{ChainingValue, HasherExt, merge_subtrees_non_root, merge_subtrees_root};
+use blake3::{Hash, hash, hazmat::{ChainingValue, HasherExt, merge_subtrees_non_root, merge_subtrees_root}};
 use bytes::{BufMut, Bytes, BytesMut};
 use chunkrs::{Chunk, ChunkHash};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::{chunk::SyncChunk, errors::SyncError};
@@ -19,6 +21,43 @@ pub trait SyncSendStream {
 pub trait SyncRecvStream {
     async fn recv(&self) -> Result<(), SyncError>;
 }
+
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    pub file_id: Uuid,
+    pub file_path: PathBuf,
+    pub total_size: usize,
+    pub hash: Option<blake3::Hash>,
+}
+
+impl FileMeta {
+    pub fn new(path: &str) -> Self {
+        Self {
+            file_id: uuid::Uuid::new_v4(),
+            file_path: PathBuf::from(path),
+            total_size: 0,
+            hash: None,
+        }
+    }
+}
+
+/*
+
+### Message Types
+
+| Tag | Name | Fields |
+|----:|------|--------|
+| 0x01 | `UploadInit` | `file_id: [u8;16]`, `file_size: u64`, `sha256: [u8;32]`, `filename: String` |
+| 0x02 | `UploadInitAck` | `file_id: [u8;16]`, `resume_offset: u64` |
+| 0x03 | `Chunk` | `file_id: [u8;16]`, `offset: u64`, `data: Bytes` |
+| 0x04 | `ChunkAck` | `file_id: [u8;16]`, `offset: u64` |
+| 0x05 | `UploadComplete` | `file_id: [u8;16]` |
+| 0x06 | `UploadCompleteAck` | `file_id: [u8;16]`, `ok: bool`, `msg: String` |
+| 0xFF | `Error` | `code: u8`, `msg: String` |
+*/
+
+const UPLOAD_INIT_TAG: u8 = 0x01;
+const CHUNK_TAG: u8 = 0x03;
 
 #[derive(Debug)]
 pub struct UploadInitEvent {
@@ -43,8 +82,8 @@ pub fn new_framed_writer(
 
 pub fn new_framed_reader(
     stream: OwnedReadHalf,
-) -> FramedWrite<OwnedReadHalf, LengthDelimitedCodec> {
-    FramedWrite::new(stream, LengthDelimitedCodec::default())
+) -> FramedRead<OwnedReadHalf, LengthDelimitedCodec> {
+    FramedRead::new(stream, LengthDelimitedCodec::default())
 }
 
 pub fn encode_chunk(chunk: Chunk) -> BytesMut {
@@ -61,11 +100,13 @@ pub fn encode_chunk(chunk: Chunk) -> BytesMut {
 }
 
 /// Upload Init Event
-/// size | field_id | hash | name
+/// size(8) | field_id(16) | hash(32) | name
 pub fn encode_upload_init(upload_init: UploadInitEvent) -> BytesMut {
     let size = upload_init.size;
 
     let mut encode_bs = BytesMut::with_capacity(100);
+
+    encode_bs.put_u8(UPLOAD_INIT_TAG);
 
     encode_bs.put_u64(size); // 8 bytes
     encode_bs.put_slice(&upload_init.file_id.into_bytes()); // 16
@@ -80,7 +121,8 @@ pub fn encode_chunk_event(chunk: ChunkEvent) -> BytesMut {
     let offset = chunk.offset;
 
     let mut encode_bs = BytesMut::with_capacity(100);
-
+    encode_bs.put_u8(CHUNK_TAG);
+    
     encode_bs.put_u64(offset);
     encode_bs.put_slice(&chunk.file_id.into_bytes());
     encode_bs.put_slice(&chunk.data);
@@ -101,7 +143,7 @@ pub fn decode_chunk(bs: Bytes) -> Result<Chunk, SyncError> {
     Ok(Chunk::with_offset(data, offset).set_hash(hash.unwrap()))
 }
 
-pub fn decode_sync_chunk(bs: Bytes) -> Result<SyncChunk, SyncError> {
+pub fn decode_chunk_event(bs: BytesMut) -> Result<ChunkEvent, SyncError> {
     if bs.len() < 24 {
         return Err(SyncError::BadChunkData(
             "chunk length must >= 24".to_string(),
@@ -110,11 +152,37 @@ pub fn decode_sync_chunk(bs: Bytes) -> Result<SyncChunk, SyncError> {
 
     let offset = u64::from_be_bytes(bs[..8].try_into().unwrap());
     let file_id = String::from_utf8_lossy(&bs[8..24]);
-    let data = Bytes::from(bs.slice(24..));
+    // let _ = bs.split_to(24);
+    let data = Bytes::copy_from_slice(&bs[24..]);
 
-    Ok(SyncChunk {
+    Ok(ChunkEvent {
+        data,
+        offset,
         file_id: uuid::Uuid::parse_str(&file_id)?,
-        bytes: data,
-        offset: offset as usize,
+    })
+}
+
+/// size(8) | field_id(16) | hash(32) | name
+pub fn decode_upload_init(bs: BytesMut) -> Result<UploadInitEvent, SyncError> {
+    if bs.len() <= 56 {
+        return Err(SyncError::BadChunkData(
+            "chunk length must > 56".to_string(),
+        ));
+    }
+
+    let file_size = u64::from_be_bytes(bs[..8].try_into().unwrap());
+    let file_id = String::from_utf8_lossy(&bs[8..24]);
+    // let _ = bs.split_to(24);
+    let hash_bs = &bs[24..56];
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(hash_bs);
+
+    let file_name = String::from_utf8_lossy(&bs[56..]);
+
+    Ok(UploadInitEvent {
+        size: file_size,
+        hash: Hash::from_bytes(hash_arr),
+        file_id: uuid::Uuid::parse_str(&file_id)?,
+        name: file_name.to_string(),
     })
 }
