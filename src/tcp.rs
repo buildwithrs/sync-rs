@@ -1,26 +1,36 @@
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::{
-    fs::File,
-    io::{AsyncReadExt, BufReader},
-    net::TcpStream,
-    sync::mpsc,
+    fs::{self, File},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
+    net::{TcpStream, tcp::OwnedWriteHalf},
+    sync::{RwLock, mpsc},
     task::JoinSet,
 };
-use tokio_util::codec::FramedRead;
+use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    errors::SyncError, protocol::{
-        ChunkEvent, FileMeta, UploadInitEvent, encode_chunk_event, encode_upload_init, new_framed_reader, new_framed_writer,
+    errors::SyncError,
+    protocol::{
+        CHUNK_TAG, ChunkEvent, FileMeta, UPLOAD_INIT_TAG, UploadInitEvent, decode_chunk_event,
+        decode_upload_init, encode_chunk_event, encode_upload_init, new_framed_reader,
+        new_framed_writer,
     },
 };
 
 const MAX_SEND_TASK: usize = 8;
-const SERVER_FOLDER: &'static str = "/tmp/uploads/";
+const SERVER_FOLDER: &'static str = "/tmp/uploads";
+
+pub type DataWriter = FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>;
 
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -145,29 +155,26 @@ impl ClientFileProcessor {
 
 #[derive(Debug)]
 pub struct ServerFileProcessor {
-    pub meta: FileMeta,
+    pub file_dict: Arc<RwLock<HashMap<Uuid, FileMeta>>>,
 }
 
 impl ServerFileProcessor {
     /// concurrently recv chunks from stream,
     /// and verify the chunk is okay,
     /// then write the chunk at the position: chunk.offset
-    async fn serve(&mut self, stream: TcpStream) -> Result<(), SyncError> {
-
+    async fn handle_file_stream(&mut self, stream: TcpStream) -> Result<(), SyncError> {
         let (reader, writer) = stream.into_split();
         let mut framed_reader = new_framed_reader(reader);
+        let mut framed_writer = new_framed_writer(writer);
 
         while let Some(payload) = framed_reader.next().await {
             match payload {
-                Ok(data) => {
-                    match self.handle_stream(data).await {
-                        Ok(_) => {},
-                        Err(e) => {
-                            eprintln!("failed handle stream: {}", e);
-                        }
-
+                Ok(mut data) => match self.handle_stream(&mut data, &mut framed_writer).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("failed handle stream: {}", e);
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!("failed to read payload: {}", e);
                 }
@@ -177,10 +184,88 @@ impl ServerFileProcessor {
         Ok(())
     }
 
-
-    async fn handle_stream(&mut self, data: BytesMut) -> Result<(), SyncError> {
+    async fn handle_stream(
+        &mut self,
+        data: &mut BytesMut,
+        writer: &mut DataWriter,
+    ) -> Result<(), SyncError> {
+        let tag = data.get_u8();
+        match tag {
+            UPLOAD_INIT_TAG => {
+                let _ = data.split_to(1);
+                self.handle_upload_init(data).await?;
+            }
+            CHUNK_TAG => {
+                let _ = data.split_to(1);
+                self.handle_chunk(data).await?;
+            }
+            _ => {}
+        }
         Ok(())
     }
+
+    async fn handle_upload_init(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
+        let upload_init = decode_upload_init(data)?;
+
+        let mut w = self.file_dict.write().await;
+        let meta = w.get(&upload_init.file_id);
+        match meta {
+            Some(mt) => return Err(SyncError::DuplicateFile(mt.file_id.to_string())),
+            None => {
+                let f_id = upload_init.file_id;
+                let idp = PathBuf::from(f_id.to_string());
+                let f_p = PathBuf::from(SERVER_FOLDER).join(idp);
+                w.insert(
+                    f_id,
+                    FileMeta::new1(
+                        upload_init.file_id,
+                        f_p.clone(),
+                        upload_init.size as usize,
+                        upload_init.hash,
+                    ),
+                );
+
+                let mut opts = tokio::fs::OpenOptions::new();
+                let _ = opts
+                    .create(true)
+                    .read(true)
+                    .append(true)
+                    .truncate(true)
+                    .open(f_p)
+                    .await?;
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
+        let chunk = decode_chunk_event(data)?;
+        let fd = self.file_dict.read().await;
+        let meta = fd.get(&chunk.file_id);
+        match meta {
+            Some(_) => {
+                let mut opts = fs::OpenOptions::new();
+                let mut f = opts
+                    .create(true)
+                    .read(true)
+                    .append(true)
+                    .truncate(true)
+                    .open(fid_2_path(chunk.file_id))
+                    .await?;
+
+                f.seek(SeekFrom::Start(chunk.offset)).await?;
+                f.write_all(&chunk.data).await?;
+            }
+            None => return Err(SyncError::FileUploadNotInit(chunk.file_id.to_string())),
+        }
+        Ok(())
+    }
+}
+
+fn fid_2_path(f_id: Uuid) -> PathBuf {
+    let idp = PathBuf::from(f_id.to_string());
+    PathBuf::from(SERVER_FOLDER).join(idp)
 }
 
 #[cfg(test)]

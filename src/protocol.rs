@@ -39,6 +39,15 @@ impl FileMeta {
             hash: None,
         }
     }
+
+    pub fn new1(file_id: Uuid, path: PathBuf, size: usize, hash: blake3::Hash) -> Self {
+        Self {
+            file_id,
+            file_path: path,
+            total_size: size,
+            hash: Some(hash),
+        }
+    }
 }
 
 /*
@@ -56,8 +65,8 @@ impl FileMeta {
 | 0xFF | `Error` | `code: u8`, `msg: String` |
 */
 
-const UPLOAD_INIT_TAG: u8 = 0x01;
-const CHUNK_TAG: u8 = 0x03;
+pub const UPLOAD_INIT_TAG: u8 = 0x01;
+pub const CHUNK_TAG: u8 = 0x03;
 
 #[derive(Debug)]
 pub struct UploadInitEvent {
@@ -122,7 +131,7 @@ pub fn encode_chunk_event(chunk: ChunkEvent) -> BytesMut {
 
     let mut encode_bs = BytesMut::with_capacity(100);
     encode_bs.put_u8(CHUNK_TAG);
-    
+
     encode_bs.put_u64(offset);
     encode_bs.put_slice(&chunk.file_id.into_bytes());
     encode_bs.put_slice(&chunk.data);
@@ -143,7 +152,7 @@ pub fn decode_chunk(bs: Bytes) -> Result<Chunk, SyncError> {
     Ok(Chunk::with_offset(data, offset).set_hash(hash.unwrap()))
 }
 
-pub fn decode_chunk_event(bs: BytesMut) -> Result<ChunkEvent, SyncError> {
+pub fn decode_chunk_event(bs: &mut BytesMut) -> Result<ChunkEvent, SyncError> {
     if bs.len() < 24 {
         return Err(SyncError::BadChunkData(
             "chunk length must >= 24".to_string(),
@@ -163,7 +172,7 @@ pub fn decode_chunk_event(bs: BytesMut) -> Result<ChunkEvent, SyncError> {
 }
 
 /// size(8) | field_id(16) | hash(32) | name
-pub fn decode_upload_init(bs: BytesMut) -> Result<UploadInitEvent, SyncError> {
+pub fn decode_upload_init(bs: &mut BytesMut) -> Result<UploadInitEvent, SyncError> {
     if bs.len() <= 56 {
         return Err(SyncError::BadChunkData(
             "chunk length must > 56".to_string(),

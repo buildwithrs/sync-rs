@@ -23,5 +23,11 @@ pub enum SyncError {
     BaoTreeEncodeError(#[from] EncodeError),
 
     #[error("uuid error: {0}")]
-    UUidError(#[from] uuid::Error)
+    UUidError(#[from] uuid::Error),
+
+    #[error("duplicate file: {0}")]
+    DuplicateFile(String),
+
+    #[error("file upload not init: {0}")]
+    FileUploadNotInit(String),
 }

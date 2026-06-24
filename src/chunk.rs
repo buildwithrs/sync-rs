@@ -1,10 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use chunkrs::{Chunk, ChunkConfig, Chunker};
-use futures::SinkExt;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::task::JoinSet;
 use tokio::{fs::File, io::BufReader};
 use uuid::Uuid;
 
