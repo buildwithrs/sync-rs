@@ -1,8 +1,7 @@
-pub mod chunk; // chunk the file into multiple parts
 pub mod protocol; // how to send the data through TCP/UDP connnection.
-pub mod tcp;  // the implement of TCP data transfer
 pub mod errors; // all the app errors
 pub mod config;
+pub mod transport;
 
 
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};

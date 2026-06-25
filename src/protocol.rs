@@ -110,8 +110,14 @@ pub struct ChunkEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ErrMsg {
-    pub code: u8,
+    pub code: u16,
     pub msg: String,
+}
+
+impl ErrMsg {
+    pub fn new(code: u16, msg: &str) -> Self {
+        Self { code, msg: msg.to_string() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,12 +157,12 @@ pub fn decode_upload_done(bs: &mut BytesMut) -> Result<UploadDoneEvent, SyncErro
     })
 }
 
-/// err_tag | code(1) | msg
+/// err_tag | code(2) | msg
 pub fn encode_error(err_msg: ErrMsg) -> BytesMut {
     let mut encode_bs = BytesMut::with_capacity(100);
     encode_bs.put_u8(ERR_TAG); // 1 byte
 
-    encode_bs.put_u8(err_msg.code); // 1 byte
+    encode_bs.put_u16(err_msg.code); // 2 byte
     encode_bs.put_slice(&err_msg.msg.into_bytes()); // variable length
     encode_bs
 }
@@ -167,8 +173,8 @@ pub fn decode_error(bs: &mut BytesMut) -> Result<ErrMsg, SyncError> {
         return Err(SyncError::BadChunkData("chunk length must > 1".to_string()));
     }
 
-    let code = u8::from_be_bytes(bs[..1].try_into().unwrap());
-    let msg = String::from_utf8_lossy(&bs[1..]);
+    let code = bs.get_u16();
+    let msg = String::from_utf8_lossy(&bs[..]);
 
     Ok(ErrMsg {
         code,

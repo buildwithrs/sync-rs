@@ -1,4 +1,4 @@
-use sync_rs::{config::CHUNK_SIZE, init_tracing, tcp::ClientFileProcessor};
+use sync_rs::{config::CHUNK_SIZE, init_tracing, transport::ClientFileProcessor};
 use tokio::net::TcpStream;
 use tracing::info;
 
