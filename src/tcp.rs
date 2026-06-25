@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::SeekFrom,
+    io::{ErrorKind, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -8,7 +8,7 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::{TcpStream, tcp::OwnedWriteHalf},
     sync::{RwLock, mpsc},
@@ -21,11 +21,10 @@ use uuid::Uuid;
 use crate::{
     errors::SyncError,
     protocol::{
-        CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_INIT_TAG, UploadDoneEvent,
-        UploadInitEvent, decode_chunk_event, decode_upload_done, decode_upload_init,
-        encode_chunk_event, encode_upload_done, encode_upload_init, new_framed_reader,
-        new_framed_writer,
-        UPLOAD_DONE_TAG,
+        CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG,
+        UploadDoneEvent, UploadInitEvent, decode_chunk_event, decode_upload_done,
+        decode_upload_init, encode_chunk_event, encode_upload_done, encode_upload_init,
+        new_framed_reader, new_framed_writer,
     },
 };
 
@@ -193,6 +192,19 @@ impl ServerFileProcessor {
         }
     }
 
+    pub async fn create_folder(&self) -> Result<(), SyncError> {
+        match tokio::fs::create_dir(SERVER_FOLDER).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.kind() == ErrorKind::AlreadyExists {
+                    return Ok(());
+                }
+
+                return Err(SyncError::IOError(e));
+            }
+        }
+    }
+
     /// concurrently recv chunks from stream,
     /// and verify the chunk is okay,
     /// then write the chunk at the position: chunk.offset
@@ -206,11 +218,11 @@ impl ServerFileProcessor {
                 Ok(mut data) => match self.handle_stream(&mut data).await {
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("failed handle stream: {}", e);
+                        warn!("failed handle stream: {}", e);
                     }
                 },
                 Err(e) => {
-                    eprintln!("failed to read payload: {}", e);
+                    warn!("failed to read payload: {}", e);
                 }
             }
         }
@@ -222,10 +234,9 @@ impl ServerFileProcessor {
         let tag = data.get_u8();
         match tag {
             UPLOAD_INIT_TAG => {
-                info!("received upload init");
-
-                let _ = data.split_to(1);
                 let f_id = self.handle_upload_init(data).await?;
+                info!("received upload init for: {}", f_id);
+
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Init);
             }
@@ -233,18 +244,17 @@ impl ServerFileProcessor {
             CHUNK_TAG => {
                 info!("received file chunk");
 
-                let _ = data.split_to(1);
                 let f_id = self.handle_chunk(data).await?;
+                info!("received chunk for: {}", f_id);
 
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Uploading);
             }
 
             UPLOAD_DONE_TAG => {
-                info!("received upload done");
-
-                let _ = data.split_to(1);
                 let ev = decode_upload_done(data)?;
+                info!("received upload done for: {}", ev.file_id);
+
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(ev.file_id, FileUploadState::Done);
             }
@@ -256,7 +266,10 @@ impl ServerFileProcessor {
     async fn handle_upload_init(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
         let upload_init = decode_upload_init(data)?;
 
+        info!("received upload init: {:?}", upload_init);
+
         let f_id = upload_init.file_id;
+        info!("init file: {}", f_id);
 
         let mut w = self.file_dict.write().await;
         let meta = w.get(&f_id);
@@ -275,7 +288,8 @@ impl ServerFileProcessor {
                     ),
                 );
 
-                create_server_file(f_p).await?;
+                info!("create file at: {:?}", f_p);
+                create_server_file(f_p, upload_init.size).await?;
             }
         };
 
@@ -284,19 +298,33 @@ impl ServerFileProcessor {
 
     async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
         let chunk = decode_chunk_event(data)?;
+
         let fd = self.file_dict.read().await;
         let meta = fd.get(&chunk.file_id);
         match meta {
             Some(mt) => {
-                let mut opts = fs::OpenOptions::new();
-                let mut f = opts
-                    .read(true)
-                    .append(true)
-                    .open(fid_2_path(chunk.file_id, mt.file_name.clone()))
+                info!("file name: {}", mt.file_name);
+
+                let f_p = PathBuf::from(SERVER_FOLDER).join(mt.file_name.clone());
+                info!("writing data into: {:?}", f_p);
+
+                // `append(true)` is intentionally NOT set: O_APPEND makes the
+                // kernel move the file position to the end of the file before
+                // every write(2), which silently overrides the `seek` below.
+                // The client sends each chunk with the offset it belongs at, so
+                // we seek + write and rely on `create_server_file` having
+                // pre-allocated the file to the final size.
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(f_p)
                     .await?;
 
                 f.seek(SeekFrom::Start(chunk.offset)).await?;
+
+                info!("writing data at: {}", chunk.offset);
                 f.write_all(&chunk.data).await?;
+                f.flush().await?;
             }
             None => return Err(SyncError::FileUploadNotInit(chunk.file_id.to_string())),
         }
@@ -305,29 +333,43 @@ impl ServerFileProcessor {
     }
 }
 
-fn fid_2_path(f_id: Uuid, name: String) -> PathBuf {
-    let idp = PathBuf::from(format!("{}_{}", f_id.to_string(), name));
-    PathBuf::from(SERVER_FOLDER).join(idp)
-}
-
-async fn create_server_file(fp: PathBuf) -> Result<(), SyncError> {
-    let mut opts = tokio::fs::OpenOptions::new();
-    let _ = opts
-        .create(true)
+/// Create the destination file (if missing) and pre-allocate it to `size` bytes.
+///
+/// Note: `append(true)` is intentionally NOT set. `std::fs::OpenOptions` rejects
+/// `append(true)` combined with `truncate(true)` — its `get_creation_mode`
+/// validation returns "creating or truncating a file requires write or append
+/// access" for that combination, even when `write(true)` is also set. The error
+/// message is misleading; the real rule is "no append + truncate".
+async fn create_server_file(fp: PathBuf, size: u64) -> Result<(), SyncError> {
+    let f = OpenOptions::new()
         .read(true)
-        .append(true)
-        .truncate(true)
+        .write(true)
+        .create(true)
         .open(fp)
         .await?;
 
+    f.set_len(size).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::tcp::{SERVER_FOLDER, create_server_file};
+
     #[test]
     fn test_uuid_v4() {
         let uid = uuid::Uuid::new_v4();
         println!("{}: {}", uid.to_string(), uid.into_bytes().len());
+    }
+
+    #[tokio::test]
+    async fn test_create_folder() {
+        let p = PathBuf::from(SERVER_FOLDER).join("README.md");
+        let res = create_server_file(p, 1000).await;
+
+        println!("create file res: {:?}", res);
+        assert!(res.is_ok());
     }
 }
