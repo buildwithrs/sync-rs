@@ -15,15 +15,17 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
     errors::SyncError,
     protocol::{
         CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_INIT_TAG, UploadDoneEvent,
-        UploadInitEvent, decode_chunk_event, decode_upload_init, encode_chunk_event,
-        encode_upload_done, encode_upload_init, new_framed_reader, new_framed_writer,
+        UploadInitEvent, decode_chunk_event, decode_upload_done, decode_upload_init,
+        encode_chunk_event, encode_upload_done, encode_upload_init, new_framed_reader,
+        new_framed_writer,
+        UPLOAD_DONE_TAG,
     },
 };
 
@@ -94,28 +96,26 @@ impl ClientFileProcessor {
         Ok(chunk_events)
     }
 
-    async fn send_chunks(
+    pub async fn send_chunks(
         &self,
         stream: TcpStream,
         chunks: Vec<ChunkEvent>,
     ) -> Result<(), SyncError> {
-        let f_meta = &self.meta;
+        if chunks.len() == 0 {
+            return Err(SyncError::NoChunks);
+        }
 
         let (_reader, writer) = stream.into_split();
         let mut framed_writer = new_framed_writer(writer);
 
         let (tx, mut rx) = mpsc::channel::<Bytes>(32);
 
-        let name = f_meta
-            .file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let f_meta = &self.meta;
         let upload_event = UploadInitEvent {
             file_id: f_meta.file_id,
             size: f_meta.total_size as u64,
             hash: f_meta.hash.unwrap(),
-            name: name.to_string(),
+            name: f_meta.file_name.clone(),
         };
 
         let done_event = UploadDoneEvent {
@@ -126,11 +126,14 @@ impl ClientFileProcessor {
         // Drains every chunk, then writes the done event.
         let writer_handle = tokio::spawn(async move {
             let upload_bs = encode_upload_init(upload_event);
+            info!("send upload init...");
+
             if let Err(e) = framed_writer.send(Bytes::from(upload_bs)).await {
                 warn!("send upload init failed: {}", e);
                 return Err(SyncError::from(e));
             }
 
+            info!("send file chunks to server...");
             while let Some(data) = rx.recv().await {
                 if let Err(e) = framed_writer.send(data).await {
                     warn!("failed to write chunk to TCP Stream: {}", e);
@@ -138,6 +141,7 @@ impl ClientFileProcessor {
                 }
             }
 
+            info!("send upload done event...");
             if let Err(e) = framed_writer
                 .send(Bytes::from(encode_upload_done(done_event)))
                 .await
@@ -175,24 +179,31 @@ impl ClientFileProcessor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerFileProcessor {
     pub file_dict: Arc<RwLock<HashMap<Uuid, FileMeta>>>,
     pub file_state: Arc<RwLock<HashMap<Uuid, FileUploadState>>>,
 }
 
 impl ServerFileProcessor {
+    pub fn new() -> Self {
+        Self {
+            file_dict: Arc::new(RwLock::new(HashMap::with_capacity(100))),
+            file_state: Arc::new(RwLock::new(HashMap::with_capacity(100))),
+        }
+    }
+
     /// concurrently recv chunks from stream,
     /// and verify the chunk is okay,
     /// then write the chunk at the position: chunk.offset
-    async fn handle_file_stream(&mut self, stream: TcpStream) -> Result<(), SyncError> {
-        let (reader, writer) = stream.into_split();
+    pub async fn handle_file_stream(&mut self, stream: TcpStream) -> Result<(), SyncError> {
+        let (reader, _writer) = stream.into_split();
         let mut framed_reader = new_framed_reader(reader);
-        let mut framed_writer = new_framed_writer(writer);
+        // let mut framed_writer = new_framed_writer(writer);
 
         while let Some(payload) = framed_reader.next().await {
             match payload {
-                Ok(mut data) => match self.handle_stream(&mut data, &mut framed_writer).await {
+                Ok(mut data) => match self.handle_stream(&mut data).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("failed handle stream: {}", e);
@@ -207,36 +218,52 @@ impl ServerFileProcessor {
         Ok(())
     }
 
-    async fn handle_stream(
-        &mut self,
-        data: &mut BytesMut,
-        writer: &mut DataWriter,
-    ) -> Result<(), SyncError> {
+    async fn handle_stream(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
         let tag = data.get_u8();
         match tag {
             UPLOAD_INIT_TAG => {
+                info!("received upload init");
+
                 let _ = data.split_to(1);
-                self.handle_upload_init(data).await?;
+                let f_id = self.handle_upload_init(data).await?;
+                let mut f_s = self.file_state.write().await;
+                f_s.insert(f_id, FileUploadState::Init);
             }
+
             CHUNK_TAG => {
+                info!("received file chunk");
+
                 let _ = data.split_to(1);
-                self.handle_chunk(data).await?;
+                let f_id = self.handle_chunk(data).await?;
+
+                let mut f_s = self.file_state.write().await;
+                f_s.insert(f_id, FileUploadState::Uploading);
+            }
+
+            UPLOAD_DONE_TAG => {
+                info!("received upload done");
+
+                let _ = data.split_to(1);
+                let ev = decode_upload_done(data)?;
+                let mut f_s = self.file_state.write().await;
+                f_s.insert(ev.file_id, FileUploadState::Done);
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn handle_upload_init(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
+    async fn handle_upload_init(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
         let upload_init = decode_upload_init(data)?;
 
+        let f_id = upload_init.file_id;
+
         let mut w = self.file_dict.write().await;
-        let meta = w.get(&upload_init.file_id);
+        let meta = w.get(&f_id);
         match meta {
             Some(mt) => return Err(SyncError::DuplicateFile(mt.file_id.to_string())),
             None => {
-                let f_id = upload_init.file_id;
-                let idp = PathBuf::from(f_id.to_string());
+                let idp = PathBuf::from(format!("{}_{}", f_id.to_string(), upload_init.name));
                 let f_p = PathBuf::from(SERVER_FOLDER).join(idp);
                 w.insert(
                     f_id,
@@ -248,33 +275,24 @@ impl ServerFileProcessor {
                     ),
                 );
 
-                let mut opts = tokio::fs::OpenOptions::new();
-                let _ = opts
-                    .create(true)
-                    .read(true)
-                    .append(true)
-                    .truncate(true)
-                    .open(f_p)
-                    .await?;
+                create_server_file(f_p).await?;
             }
         };
 
-        Ok(())
+        Ok(f_id)
     }
 
-    async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
+    async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
         let chunk = decode_chunk_event(data)?;
         let fd = self.file_dict.read().await;
         let meta = fd.get(&chunk.file_id);
         match meta {
-            Some(_) => {
+            Some(mt) => {
                 let mut opts = fs::OpenOptions::new();
                 let mut f = opts
-                    .create(true)
                     .read(true)
                     .append(true)
-                    .truncate(true)
-                    .open(fid_2_path(chunk.file_id))
+                    .open(fid_2_path(chunk.file_id, mt.file_name.clone()))
                     .await?;
 
                 f.seek(SeekFrom::Start(chunk.offset)).await?;
@@ -282,13 +300,27 @@ impl ServerFileProcessor {
             }
             None => return Err(SyncError::FileUploadNotInit(chunk.file_id.to_string())),
         }
-        Ok(())
+
+        Ok(chunk.file_id)
     }
 }
 
-fn fid_2_path(f_id: Uuid) -> PathBuf {
-    let idp = PathBuf::from(f_id.to_string());
+fn fid_2_path(f_id: Uuid, name: String) -> PathBuf {
+    let idp = PathBuf::from(format!("{}_{}", f_id.to_string(), name));
     PathBuf::from(SERVER_FOLDER).join(idp)
+}
+
+async fn create_server_file(fp: PathBuf) -> Result<(), SyncError> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    let _ = opts
+        .create(true)
+        .read(true)
+        .append(true)
+        .truncate(true)
+        .open(fp)
+        .await?;
+
+    Ok(())
 }
 
 #[cfg(test)]

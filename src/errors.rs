@@ -19,6 +19,9 @@ pub enum SyncError {
     #[error("chunk data is broken: {0}")]
     BadChunkData(String),
 
+    #[error("no chunks")]
+    NoChunks,
+
     #[error("encode error: {0}")]
     BaoTreeEncodeError(#[from] EncodeError),
 

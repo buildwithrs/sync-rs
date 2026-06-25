@@ -8,16 +8,12 @@ use uuid::Uuid;
 
 use crate::errors::SyncError;
 
-const CHUNK_SIZE: usize = 64 * 1024;
-const CHUNK_SIZE_T: usize = 100;
-
 #[derive(Debug)]
 pub struct SyncChunk {
     pub file_id: Uuid,
     pub bytes: Bytes,
     pub offset: usize,
 }
-
 
 /// split the file into chunks
 pub async fn split_file(file_path: &str) -> Result<Vec<Chunk>, SyncError> {
@@ -82,11 +78,10 @@ async fn split_file1(file_path: &str, ck_size: usize) -> Result<Receiver<SyncChu
     Ok(rx)
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use crate::chunk::{CHUNK_SIZE_T, split_file, split_file1};
+    use crate::chunk::{split_file, split_file1};
+    use crate::config::CHUNK_SIZE_T;
 
     #[tokio::test]
     async fn test_chunks() {
