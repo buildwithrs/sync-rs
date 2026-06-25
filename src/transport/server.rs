@@ -1,29 +1,27 @@
 use std::{
     collections::HashMap,
     io::{ErrorKind, SeekFrom},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
-    net::{TcpStream, tcp::OwnedWriteHalf},
-    sync::{RwLock, mpsc},
-    task::JoinSet,
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::RwLock,
 };
-use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::SERVER_FOLDER, errors::SyncError, protocol::{
-        CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG,
-        UploadDoneEvent, UploadInitEvent, decode_chunk_event, decode_upload_done,
-        decode_upload_init, encode_chunk_event, encode_upload_done, encode_upload_init,
-        new_framed_reader, new_framed_writer,
+    config::SERVER_FOLDER,
+    errors::SyncError,
+    protocol::{
+        CHUNK_TAG, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG, decode_chunk_event,
+        decode_upload_done, decode_upload_init, encode_error, new_framed_reader, new_framed_writer,
     },
 };
 
@@ -58,9 +56,9 @@ impl ServerFileProcessor {
     /// and verify the chunk is okay,
     /// then write the chunk at the position: chunk.offset
     pub async fn handle_file_stream(&mut self, stream: TcpStream) -> Result<(), SyncError> {
-        let (reader, _writer) = stream.into_split();
+        let (reader, writer) = stream.into_split();
         let mut framed_reader = new_framed_reader(reader);
-        // let mut framed_writer = new_framed_writer(writer);
+        let mut framed_writer = new_framed_writer(writer);
 
         while let Some(payload) = framed_reader.next().await {
             match payload {
@@ -68,6 +66,7 @@ impl ServerFileProcessor {
                     Ok(_) => {}
                     Err(e) => {
                         warn!("failed handle stream: {}", e);
+                        let _ = framed_writer.send(encode_error(e.into())).await;
                     }
                 },
                 Err(e) => {

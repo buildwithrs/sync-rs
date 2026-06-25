@@ -1,29 +1,20 @@
-use std::{
-    collections::HashMap,
-    io::{ErrorKind, SeekFrom},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-use bytes::{Buf, Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures::SinkExt;
 use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
-    net::{TcpStream, tcp::OwnedWriteHalf},
-    sync::{RwLock, mpsc},
+    fs::File,
+    io::{AsyncReadExt, BufReader},
+    net::TcpStream,
+    sync::mpsc,
     task::JoinSet,
 };
-use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::{
-    config::MAX_SEND_TASK, errors::SyncError, protocol::{
-        CHUNK_TAG, ChunkEvent, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG,
-        UploadDoneEvent, UploadInitEvent, decode_chunk_event, decode_upload_done,
-        decode_upload_init, encode_chunk_event, encode_upload_done, encode_upload_init,
-        new_framed_reader, new_framed_writer,
+    config::MAX_SEND_TASK,
+    errors::SyncError,
+    protocol::{
+        ChunkEvent, FileMeta, UploadDoneEvent, UploadInitEvent, encode_chunk_event,
+        encode_upload_done, encode_upload_init, new_framed_writer,
     },
 };
 
@@ -111,10 +102,8 @@ impl ClientFileProcessor {
         // Writer task: owns `rx` and the framed writer.
         // Drains every chunk, then writes the done event.
         let writer_handle = tokio::spawn(async move {
-            let upload_bs = encode_upload_init(upload_event);
             info!("send upload init...");
-
-            if let Err(e) = framed_writer.send(Bytes::from(upload_bs)).await {
+            if let Err(e) = framed_writer.send(encode_upload_init(upload_event)).await {
                 warn!("send upload init failed: {}", e);
                 return Err(SyncError::from(e));
             }

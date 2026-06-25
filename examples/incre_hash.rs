@@ -7,7 +7,10 @@ struct IncrementalHasher {
 
 impl IncrementalHasher {
     fn new(chunk_size: u64) -> Self {
-        Self { chunk_hashes: HashMap::new(), chunk_size }
+        Self {
+            chunk_hashes: HashMap::new(),
+            chunk_size,
+        }
     }
 
     fn update_chunk(&mut self, index: u64, data: &[u8]) {

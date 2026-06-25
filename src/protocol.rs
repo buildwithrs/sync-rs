@@ -1,27 +1,12 @@
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use blake3::Hash;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chunkrs::{Chunk, ChunkHash};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::info;
 use uuid::Uuid;
 
 use crate::errors::SyncError;
-
-/// send chunked file data stream in client side
-#[async_trait]
-pub trait SyncSendStream {
-    async fn send(self, chunks: Vec<Chunk>) -> Result<(), SyncError>;
-}
-
-/// send chunked file data stream in server side
-#[async_trait]
-pub trait SyncRecvStream {
-    async fn recv(&self) -> Result<(), SyncError>;
-}
 
 #[derive(Debug, Clone)]
 pub enum FileUploadState {
@@ -43,10 +28,10 @@ impl FileMeta {
     pub fn new(path: &str) -> Self {
         let p = PathBuf::from(path);
         let p1 = p.clone();
-        
+
         Self {
             file_id: uuid::Uuid::new_v4(),
-            file_path: p, 
+            file_path: p,
             file_name: Self::path_2_name(p1),
             total_size: 0,
             hash: None,
@@ -65,12 +50,11 @@ impl FileMeta {
     }
 
     fn path_2_name(path: PathBuf) -> String {
-        path
-            .file_name()
+        path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("unknown").to_string()
+            .unwrap_or("unknown")
+            .to_string()
     }
-
 }
 
 /*
@@ -116,7 +100,10 @@ pub struct ErrMsg {
 
 impl ErrMsg {
     pub fn new(code: u16, msg: &str) -> Self {
-        Self { code, msg: msg.to_string() }
+        Self {
+            code,
+            msg: msg.to_string(),
+        }
     }
 }
 
@@ -152,19 +139,17 @@ pub fn decode_upload_done(bs: &mut BytesMut) -> Result<UploadDoneEvent, SyncErro
     }
 
     let file_id = bytes_to_uid(bs);
-    Ok(UploadDoneEvent {
-        file_id,
-    })
+    Ok(UploadDoneEvent { file_id })
 }
 
 /// err_tag | code(2) | msg
-pub fn encode_error(err_msg: ErrMsg) -> BytesMut {
+pub fn encode_error(err_msg: ErrMsg) -> Bytes {
     let mut encode_bs = BytesMut::with_capacity(100);
     encode_bs.put_u8(ERR_TAG); // 1 byte
 
     encode_bs.put_u16(err_msg.code); // 2 byte
     encode_bs.put_slice(&err_msg.msg.into_bytes()); // variable length
-    encode_bs
+    encode_bs.freeze()
 }
 
 /// code(1) | msg
@@ -182,21 +167,6 @@ pub fn decode_error(bs: &mut BytesMut) -> Result<ErrMsg, SyncError> {
     })
 }
 
-pub fn encode_chunk(chunk: Chunk) -> BytesMut {
-    let offset = chunk.offset.unwrap_or(0);
-
-    let mut encode_bs = BytesMut::with_capacity(100);
-    encode_bs.put_u64(offset);
-
-    let hash = chunk.hash.unwrap_or(ChunkHash::new([0u8; 32]));
-    encode_bs.put_slice(hash.as_bytes());
-
-    encode_bs.put_slice(&chunk.data);
-    encode_bs
-}
-
-
-
 /// Chunk Event
 /// offset(8) | field_id(uuid: 16) | data
 pub fn encode_chunk_event(chunk: ChunkEvent) -> BytesMut {
@@ -209,20 +179,6 @@ pub fn encode_chunk_event(chunk: ChunkEvent) -> BytesMut {
     encode_bs.put_slice(&chunk.file_id.into_bytes());
     encode_bs.put_slice(&chunk.data);
     encode_bs
-}
-
-pub fn decode_chunk(bs: Bytes) -> Result<Chunk, SyncError> {
-    if bs.len() < 40 {
-        return Err(SyncError::BadChunkData(
-            "chunk length must >= 40".to_string(),
-        ));
-    }
-
-    let offset = u64::from_be_bytes(bs[..8].try_into().unwrap());
-    let hash = ChunkHash::from_slice(&bs[8..40]);
-
-    let data = Bytes::from(bs.slice(40..));
-    Ok(Chunk::with_offset(data, offset).set_hash(hash.unwrap()))
 }
 
 pub fn decode_chunk_event(bs: &mut BytesMut) -> Result<ChunkEvent, SyncError> {
@@ -245,19 +201,16 @@ pub fn decode_chunk_event(bs: &mut BytesMut) -> Result<ChunkEvent, SyncError> {
 }
 
 /// Upload Init Event
-/// size(8) | field_id(16) | hash(32) | name
-pub fn encode_upload_init(upload_init: UploadInitEvent) -> BytesMut {
+/// tag(1) | size(8) | field_id(16) | hash(32) | name
+pub fn encode_upload_init(upload_init: UploadInitEvent) -> Bytes {
     let mut encode_bs = BytesMut::with_capacity(100);
     encode_bs.put_u8(UPLOAD_INIT_TAG); // 1 byte
 
     encode_bs.put_u64(upload_init.size); // 8 bytes
-    let uid_bs = &upload_init.file_id.into_bytes();
-    println!("writing uid bytes: {:?} into buffer", uid_bs);
-
-    encode_bs.put_slice(uid_bs); // 16
+    encode_bs.put_slice(&upload_init.file_id.into_bytes()); // 16
     encode_bs.put_slice(upload_init.hash.as_bytes()); // 32 
     encode_bs.put_slice(&upload_init.name.into_bytes()); // variable length
-    encode_bs
+    encode_bs.freeze()
 }
 
 /// size(8) | field_id(16) | hash(32) | name
@@ -295,12 +248,12 @@ fn bytes_to_uid(bs: &mut BytesMut) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, Bytes};
+    use bytes::{Buf, Bytes, BytesMut};
 
-use crate::protocol::{
-        ChunkEvent, ErrMsg, UploadDoneEvent, UploadInitEvent, CHUNK_TAG, ERR_TAG, UPLOAD_DONE_TAG,
-        decode_chunk_event, decode_error, decode_upload_done, decode_upload_init, encode_chunk_event,
-        encode_error, encode_upload_done, encode_upload_init,
+    use crate::protocol::{
+        CHUNK_TAG, ChunkEvent, ERR_TAG, ErrMsg, UPLOAD_DONE_TAG, UploadDoneEvent, UploadInitEvent,
+        decode_chunk_event, decode_error, decode_upload_done, decode_upload_init,
+        encode_chunk_event, encode_error, encode_upload_done, encode_upload_init,
     };
 
     #[test]
@@ -319,7 +272,8 @@ use crate::protocol::{
         let tag = bs.get_u8();
         println!("tag: {}", tag);
 
-        let decode_ev = decode_upload_init(&mut bs);
+        let mut bs_mut = BytesMut::from(bs);
+        let decode_ev = decode_upload_init(&mut bs_mut);
         println!("decode_ev: {:?}", decode_ev);
         assert!(decode_ev.is_ok());
 
@@ -349,7 +303,7 @@ use crate::protocol::{
             msg: "something went wrong".to_string(),
         };
 
-        let mut bs = encode_error(ev.clone());
+        let mut bs = BytesMut::from(encode_error(ev.clone()));
         let tag = bs.get_u8();
         assert_eq!(tag, ERR_TAG);
 

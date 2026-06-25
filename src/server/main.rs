@@ -3,7 +3,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<() >{
+async fn main() -> anyhow::Result<()> {
     init_tracing();
     info!("Sync-RS Server");
 
@@ -13,8 +13,11 @@ async fn main() -> anyhow::Result<() >{
 
     info!("creating upload folder on server");
     server.create_folder().await?;
-    
-    info!("server working on addr: {}, ready to receive connection", addr);
+
+    info!(
+        "server working on addr: {}, ready to receive connection",
+        addr
+    );
     loop {
         let (stream, remote) = listender.accept().await?;
         let mut s_c = server.clone();

@@ -3,12 +3,12 @@ use tokio::net::TcpStream;
 use tracing::info;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<() >{
+async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-         anyhow::bail!("client need a file path");
+        anyhow::bail!("client need a file path");
     }
 
     info!("Sync-RS Client");
