@@ -67,14 +67,17 @@ impl FileMeta {
 | 0x02 | `UploadInitAck` | `file_id: [u8;16]`, `resume_offset: u64` |
 | 0x03 | `Chunk` | `file_id: [u8;16]`, `offset: u64`, `data: Bytes` |
 | 0x04 | `ChunkAck` | `file_id: [u8;16]`, `offset: u64` |
-| 0x05 | `UploadComplete` | `file_id: [u8;16]` |
-| 0x06 | `UploadCompleteAck` | `file_id: [u8;16]`, `ok: bool`, `msg: String` |
+| 0x05 | `UploadDone` | `file_id: [u8;16]` |
+| 0x06 | `UploadDoneAck` | `file_id: [u8;16]`, `ok: bool`, `msg: String` |
 | 0xFF | `Error` | `code: u8`, `msg: String` |
 */
 
 pub const UPLOAD_INIT_TAG: u8 = 0x01;
+pub const UPLOAD_INIT_ACK_TAG: u8 = 0x02;
 pub const CHUNK_TAG: u8 = 0x03;
+pub const CHUNK_ACK_TAG: u8 = 0x04;
 pub const UPLOAD_DONE_TAG: u8 = 0x05;
+pub const UPLOAD_DONE_ACK_TAG: u8 = 0x06;
 pub const ERR_TAG: u8 = 0xFF;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,10 +89,22 @@ pub struct UploadInitEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct UploadInitACK {
+    pub file_id: Uuid,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChunkEvent {
     pub file_id: Uuid,
     pub offset: u64,
     pub data: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkACK {
+    pub file_id: Uuid,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +125,13 @@ impl ErrMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UploadDoneEvent {
     pub file_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadDoneACK {
+    pub file_id: Uuid,
+    pub ok: bool,
+    pub msg: String,
 }
 
 pub fn new_framed_writer(
@@ -238,6 +260,99 @@ pub fn decode_upload_init(bs: &mut BytesMut) -> Result<UploadInitEvent, SyncErro
     })
 }
 
+/// Upload Init ACK
+/// tag(1) | file_id(16) | offset(8)
+pub fn encode_upload_init_ack(ack: UploadInitACK) -> Bytes {
+    let mut encode_bs = BytesMut::with_capacity(25);
+    encode_bs.put_u8(UPLOAD_INIT_ACK_TAG);
+    encode_bs.put_slice(&ack.file_id.into_bytes());
+    encode_bs.put_u64(ack.offset);
+    encode_bs.freeze()
+}
+
+/// file_id(16) | offset(8)
+pub fn decode_upload_init_ack(bs: &mut BytesMut) -> Result<UploadInitACK, SyncError> {
+    if bs.len() < 24 {
+        return Err(SyncError::BadChunkData(
+            "upload init ack chunk length must >= 24".to_string(),
+        ));
+    }
+
+    let mut uid_arr = [0u8; 16];
+    uid_arr.copy_from_slice(&bs[..16]);
+    let _ = bs.split_to(16);
+
+    let offset = bs.get_u64();
+
+    Ok(UploadInitACK {
+        file_id: Uuid::from_bytes(uid_arr),
+        offset,
+    })
+}
+
+/// Chunk ACK
+/// tag(1) | file_id(16) | offset(8)
+pub fn encode_chunk_ack(ack: ChunkACK) -> Bytes {
+    let mut encode_bs = BytesMut::with_capacity(25);
+    encode_bs.put_u8(CHUNK_ACK_TAG);
+    encode_bs.put_slice(&ack.file_id.into_bytes());
+    encode_bs.put_u64(ack.offset);
+    encode_bs.freeze()
+}
+
+/// file_id(16) | offset(8)
+pub fn decode_chunk_ack(bs: &mut BytesMut) -> Result<ChunkACK, SyncError> {
+    if bs.len() < 24 {
+        return Err(SyncError::BadChunkData(
+            "chunk ack length must >= 24".to_string(),
+        ));
+    }
+
+    let mut uid_arr = [0u8; 16];
+    uid_arr.copy_from_slice(&bs[..16]);
+    let _ = bs.split_to(16);
+
+    let offset = bs.get_u64();
+
+    Ok(ChunkACK {
+        file_id: Uuid::from_bytes(uid_arr),
+        offset,
+    })
+}
+
+/// Upload Done ACK
+/// tag(1) | file_id(16) | ok(1) | msg
+pub fn encode_upload_done_ack(ack: UploadDoneACK) -> Bytes {
+    let mut encode_bs = BytesMut::with_capacity(100);
+    encode_bs.put_u8(UPLOAD_DONE_ACK_TAG);
+    encode_bs.put_slice(&ack.file_id.into_bytes());
+    encode_bs.put_u8(if ack.ok { 1 } else { 0 });
+    encode_bs.put_slice(&ack.msg.into_bytes());
+    encode_bs.freeze()
+}
+
+/// file_id(16) | ok(1) | msg
+pub fn decode_upload_done_ack(bs: &mut BytesMut) -> Result<UploadDoneACK, SyncError> {
+    if bs.len() < 17 {
+        return Err(SyncError::BadChunkData(
+            "upload done ack length must >= 17".to_string(),
+        ));
+    }
+
+    let mut uid_arr = [0u8; 16];
+    uid_arr.copy_from_slice(&bs[..16]);
+    let _ = bs.split_to(16);
+
+    let ok = bs.get_u8() != 0;
+    let msg = String::from_utf8_lossy(&bs[..]).to_string();
+
+    Ok(UploadDoneACK {
+        file_id: Uuid::from_bytes(uid_arr),
+        ok,
+        msg,
+    })
+}
+
 fn bytes_to_uid(bs: &mut BytesMut) -> Uuid {
     let mut uid_arr = [0u8; 16];
     uid_arr.copy_from_slice(&bs[..16]);
@@ -251,9 +366,12 @@ mod tests {
     use bytes::{Buf, Bytes, BytesMut};
 
     use crate::protocol::{
-        CHUNK_TAG, ChunkEvent, ERR_TAG, ErrMsg, UPLOAD_DONE_TAG, UploadDoneEvent, UploadInitEvent,
-        decode_chunk_event, decode_error, decode_upload_done, decode_upload_init,
-        encode_chunk_event, encode_error, encode_upload_done, encode_upload_init,
+        CHUNK_ACK_TAG, CHUNK_TAG, ChunkACK, ChunkEvent, ERR_TAG, ErrMsg, UPLOAD_DONE_ACK_TAG,
+        UPLOAD_DONE_TAG, UPLOAD_INIT_ACK_TAG, UploadDoneACK, UploadDoneEvent, UploadInitACK,
+        UploadInitEvent, decode_chunk_ack, decode_chunk_event, decode_error,
+        decode_upload_done, decode_upload_done_ack, decode_upload_init, decode_upload_init_ack,
+        encode_chunk_ack, encode_chunk_event, encode_error, encode_upload_done,
+        encode_upload_done_ack, encode_upload_init, encode_upload_init_ack,
     };
 
     #[test]
@@ -322,6 +440,68 @@ mod tests {
         assert_eq!(tag, UPLOAD_DONE_TAG);
 
         let decode_ev = decode_upload_done(&mut bs).unwrap();
+        assert_eq!(decode_ev, ev);
+    }
+
+    #[test]
+    fn test_encode_decode_upload_init_ack() {
+        let ev = UploadInitACK {
+            file_id: uuid::Uuid::new_v4(),
+            offset: 4096,
+        };
+
+        let mut bs = BytesMut::from(encode_upload_init_ack(ev.clone()));
+        let tag = bs.get_u8();
+        assert_eq!(tag, UPLOAD_INIT_ACK_TAG);
+
+        let decode_ev = decode_upload_init_ack(&mut bs).unwrap();
+        assert_eq!(decode_ev, ev);
+    }
+
+    #[test]
+    fn test_encode_decode_chunk_ack() {
+        let ev = ChunkACK {
+            file_id: uuid::Uuid::new_v4(),
+            offset: 8192,
+        };
+
+        let mut bs = BytesMut::from(encode_chunk_ack(ev.clone()));
+        let tag = bs.get_u8();
+        assert_eq!(tag, CHUNK_ACK_TAG);
+
+        let decode_ev = decode_chunk_ack(&mut bs).unwrap();
+        assert_eq!(decode_ev, ev);
+    }
+
+    #[test]
+    fn test_encode_decode_upload_done_ack() {
+        let ev = UploadDoneACK {
+            file_id: uuid::Uuid::new_v4(),
+            ok: true,
+            msg: "finalized ok".to_string(),
+        };
+
+        let mut bs = BytesMut::from(encode_upload_done_ack(ev.clone()));
+        let tag = bs.get_u8();
+        assert_eq!(tag, UPLOAD_DONE_ACK_TAG);
+
+        let decode_ev = decode_upload_done_ack(&mut bs).unwrap();
+        assert_eq!(decode_ev, ev);
+    }
+
+    #[test]
+    fn test_encode_decode_upload_done_ack_failure() {
+        let ev = UploadDoneACK {
+            file_id: uuid::Uuid::new_v4(),
+            ok: false,
+            msg: "hash mismatch".to_string(),
+        };
+
+        let mut bs = BytesMut::from(encode_upload_done_ack(ev.clone()));
+        let tag = bs.get_u8();
+        assert_eq!(tag, UPLOAD_DONE_ACK_TAG);
+
+        let decode_ev = decode_upload_done_ack(&mut bs).unwrap();
         assert_eq!(decode_ev, ev);
     }
 }

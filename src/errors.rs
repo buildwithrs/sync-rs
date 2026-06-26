@@ -30,6 +30,9 @@ pub enum SyncError {
 
     #[error("file upload not init: {0}")]
     FileUploadNotInit(String),
+
+    #[error("unknown event: {0}")]
+    UnknownEvent(u8),
 }
 
 pub const IO_ERRCODE: u16 = 1001;
@@ -38,6 +41,7 @@ pub const BADCHUNK_ERRCODE: u16 = 1003;
 pub const DUPLICATE_FILE_ERRCODE: u16 = 1004;
 pub const UPLOAD_NOT_INIT_CODE: u16 = 1005;
 pub const NO_CHUNKS_CODE: u16 = 1006;
+pub const UNKOWN_EVENT: u16 = 1007;
 
 impl From<SyncError> for ErrMsg {
     fn from(err: SyncError) -> Self {
@@ -49,6 +53,7 @@ impl From<SyncError> for ErrMsg {
             SyncError::DuplicateFile(e) => ErrMsg::new(DUPLICATE_FILE_ERRCODE, &e.to_string()),
             SyncError::FileUploadNotInit(e) => ErrMsg::new(UPLOAD_NOT_INIT_CODE, &e.to_string()),
             SyncError::NoChunks => ErrMsg::new(NO_CHUNKS_CODE, "no file content chunks"),
+            SyncError::UnknownEvent(tag) => ErrMsg::new(UNKOWN_EVENT, &format!("unknown event: {}", tag)),
         }
     }
 }

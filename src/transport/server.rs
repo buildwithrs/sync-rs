@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     fs::OpenOptions,
@@ -17,18 +17,25 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::SERVER_FOLDER,
-    errors::SyncError,
-    protocol::{
-        CHUNK_TAG, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG, decode_chunk_event,
-        decode_upload_done, decode_upload_init, encode_error, new_framed_reader, new_framed_writer,
+    config::SERVER_FOLDER, errors::SyncError, protocol::{
+        CHUNK_TAG, ChunkACK, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG, UploadDoneACK, UploadInitACK, decode_chunk_event, decode_upload_done, decode_upload_init, encode_chunk_ack, encode_error, encode_upload_done_ack, encode_upload_init_ack, new_framed_reader, new_framed_writer,
     },
 };
 
+pub type FileDict = Arc<RwLock<HashMap<Uuid, FileMeta>>>;
+pub type FileState = Arc<RwLock<HashMap<Uuid, FileUploadState>>>;
+
+#[derive(Debug)]
+pub enum ServerRespEvent {
+    UploadInitACK(UploadInitACK),
+    ChunkACK(ChunkACK),
+    UploadDoneACK(UploadDoneACK),
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerFileProcessor {
-    pub file_dict: Arc<RwLock<HashMap<Uuid, FileMeta>>>,
-    pub file_state: Arc<RwLock<HashMap<Uuid, FileUploadState>>>,
+    pub file_dict: FileDict,
+    pub file_state: FileState,
 }
 
 impl ServerFileProcessor {
@@ -63,7 +70,9 @@ impl ServerFileProcessor {
         while let Some(payload) = framed_reader.next().await {
             match payload {
                 Ok(mut data) => match self.handle_stream(&mut data).await {
-                    Ok(_) => {}
+                    Ok(resp) => {
+                        let _ = framed_writer.send(encode_server_resp_event(resp)).await;
+                    }
                     Err(e) => {
                         warn!("failed handle stream: {}", e);
                         let _ = framed_writer.send(encode_error(e.into())).await;
@@ -78,7 +87,7 @@ impl ServerFileProcessor {
         Ok(())
     }
 
-    async fn handle_stream(&mut self, data: &mut BytesMut) -> Result<(), SyncError> {
+    async fn handle_stream(&mut self, data: &mut BytesMut) -> Result<ServerRespEvent, SyncError> {
         let tag = data.get_u8();
         match tag {
             UPLOAD_INIT_TAG => {
@@ -87,16 +96,23 @@ impl ServerFileProcessor {
 
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Init);
+
+                return Ok(ServerRespEvent::UploadInitACK(UploadInitACK { file_id: f_id, offset: 0 }));
             }
 
             CHUNK_TAG => {
                 info!("received file chunk");
 
-                let f_id = self.handle_chunk(data).await?;
+                let (f_id, offset) = self.handle_chunk(data).await?;
                 info!("received chunk for: {}", f_id);
 
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Uploading);
+
+                return Ok(ServerRespEvent::ChunkACK(ChunkACK {
+                    file_id: f_id,
+                    offset,
+                }));
             }
 
             UPLOAD_DONE_TAG => {
@@ -105,10 +121,17 @@ impl ServerFileProcessor {
 
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(ev.file_id, FileUploadState::Done);
+
+                return Ok(ServerRespEvent::UploadDoneACK(UploadDoneACK {
+                    file_id: ev.file_id,
+                    ok: true,
+                    msg: String::new(),
+                }));
             }
-            _ => {}
+            _ => {
+                return Err(SyncError::UnknownEvent(tag));
+            }
         }
-        Ok(())
     }
 
     async fn handle_upload_init(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
@@ -144,7 +167,7 @@ impl ServerFileProcessor {
         Ok(f_id)
     }
 
-    async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<Uuid, SyncError> {
+    async fn handle_chunk(&mut self, data: &mut BytesMut) -> Result<(Uuid, u64), SyncError> {
         let chunk = decode_chunk_event(data)?;
 
         let fd = self.file_dict.read().await;
@@ -177,7 +200,15 @@ impl ServerFileProcessor {
             None => return Err(SyncError::FileUploadNotInit(chunk.file_id.to_string())),
         }
 
-        Ok(chunk.file_id)
+        Ok((chunk.file_id, chunk.offset))
+    }
+}
+
+fn encode_server_resp_event(resp: ServerRespEvent) -> Bytes {
+    match resp {
+        ServerRespEvent::UploadInitACK(ack) => encode_upload_init_ack(ack),
+        ServerRespEvent::ChunkACK(ack) => encode_chunk_ack(ack),
+        ServerRespEvent::UploadDoneACK(ack) => encode_upload_done_ack(ack),
     }
 }
 
