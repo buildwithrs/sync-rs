@@ -8,6 +8,9 @@ use uuid::Uuid;
 
 use crate::errors::SyncError;
 
+pub type SRFramedRead = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
+pub type SRFramedWrite = FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>;
+
 #[derive(Debug, Clone)]
 pub enum FileUploadState {
     Init,
@@ -261,16 +264,16 @@ pub fn decode_upload_init(bs: &mut BytesMut) -> Result<UploadInitEvent, SyncErro
 }
 
 /// Upload Init ACK
-/// tag(1) | file_id(16) | offset(8)
+/// tag(1) | offset(8) | file_id(16)
 pub fn encode_upload_init_ack(ack: UploadInitACK) -> Bytes {
     let mut encode_bs = BytesMut::with_capacity(25);
     encode_bs.put_u8(UPLOAD_INIT_ACK_TAG);
-    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.put_u64(ack.offset);
+    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.freeze()
 }
 
-/// file_id(16) | offset(8)
+/// offset(8) | file_id(16)
 pub fn decode_upload_init_ack(bs: &mut BytesMut) -> Result<UploadInitACK, SyncError> {
     if bs.len() < 24 {
         return Err(SyncError::BadChunkData(
@@ -278,29 +281,24 @@ pub fn decode_upload_init_ack(bs: &mut BytesMut) -> Result<UploadInitACK, SyncEr
         ));
     }
 
-    let mut uid_arr = [0u8; 16];
-    uid_arr.copy_from_slice(&bs[..16]);
-    let _ = bs.split_to(16);
-
     let offset = bs.get_u64();
-
     Ok(UploadInitACK {
-        file_id: Uuid::from_bytes(uid_arr),
         offset,
+        file_id: bytes_to_uid(bs),
     })
 }
 
 /// Chunk ACK
-/// tag(1) | file_id(16) | offset(8)
+/// tag(1) | offset(8) | file_id(16)
 pub fn encode_chunk_ack(ack: ChunkACK) -> Bytes {
     let mut encode_bs = BytesMut::with_capacity(25);
     encode_bs.put_u8(CHUNK_ACK_TAG);
-    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.put_u64(ack.offset);
+    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.freeze()
 }
 
-/// file_id(16) | offset(8)
+/// offset(8) | file_id(16)
 pub fn decode_chunk_ack(bs: &mut BytesMut) -> Result<ChunkACK, SyncError> {
     if bs.len() < 24 {
         return Err(SyncError::BadChunkData(
@@ -308,14 +306,9 @@ pub fn decode_chunk_ack(bs: &mut BytesMut) -> Result<ChunkACK, SyncError> {
         ));
     }
 
-    let mut uid_arr = [0u8; 16];
-    uid_arr.copy_from_slice(&bs[..16]);
-    let _ = bs.split_to(16);
-
     let offset = bs.get_u64();
-
     Ok(ChunkACK {
-        file_id: Uuid::from_bytes(uid_arr),
+        file_id: bytes_to_uid(bs),
         offset,
     })
 }
@@ -325,8 +318,8 @@ pub fn decode_chunk_ack(bs: &mut BytesMut) -> Result<ChunkACK, SyncError> {
 pub fn encode_upload_done_ack(ack: UploadDoneACK) -> Bytes {
     let mut encode_bs = BytesMut::with_capacity(100);
     encode_bs.put_u8(UPLOAD_DONE_ACK_TAG);
-    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.put_u8(if ack.ok { 1 } else { 0 });
+    encode_bs.put_slice(&ack.file_id.into_bytes());
     encode_bs.put_slice(&ack.msg.into_bytes());
     encode_bs.freeze()
 }
@@ -339,15 +332,11 @@ pub fn decode_upload_done_ack(bs: &mut BytesMut) -> Result<UploadDoneACK, SyncEr
         ));
     }
 
-    let mut uid_arr = [0u8; 16];
-    uid_arr.copy_from_slice(&bs[..16]);
-    let _ = bs.split_to(16);
-
     let ok = bs.get_u8() != 0;
-    let msg = String::from_utf8_lossy(&bs[..]).to_string();
-
+    let file_id = bytes_to_uid(bs);
+    let msg = String::from_utf8_lossy(&bs[16..]).to_string();
     Ok(UploadDoneACK {
-        file_id: Uuid::from_bytes(uid_arr),
+        file_id,
         ok,
         msg,
     })

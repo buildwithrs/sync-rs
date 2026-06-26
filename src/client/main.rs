@@ -1,4 +1,5 @@
 use sync_rs::errors::SyncClientError;
+use sync_rs::protocol::{new_framed_reader, new_framed_writer};
 use tokio::net::TcpStream;
 use tokio_retry2::strategy::{ExponentialBackoff, MaxInterval, jitter};
 use tokio_retry2::{Retry, RetryError};
@@ -36,7 +37,18 @@ async fn main() -> anyhow::Result<()> {
     info!("file has been chunked into {} chunks", chunks.len());
     info!("starting upload...");
 
-    client.send_chunks(stream, chunks).await?;
+    let (r, w) = stream.into_split();
+    let mut fr = new_framed_reader(r);
+    let mut fw = new_framed_writer(w);
+
+    let init_resp = client.send_upload_init(&mut fr, &mut fw).await?;
+    info!("received init resp: {:?}", init_resp);
+
+    let _ = client.send_chunks(&mut fr, &mut fw, chunks).await?;
+    info!("done send the chunks");
+
+    let done_ack = client.send_upload_done(&mut fr, &mut fw).await?;
+    info!("received upload done ack: {:?}", done_ack);
 
     Ok(())
 }

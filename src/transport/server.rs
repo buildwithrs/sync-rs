@@ -109,10 +109,13 @@ impl ServerFileProcessor {
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Uploading);
 
-                return Ok(ServerRespEvent::ChunkACK(ChunkACK {
+                let ack = ChunkACK {
                     file_id: f_id,
                     offset,
-                }));
+                };
+                info!("sending back chunk ack: {:?}", ack);
+
+                return Ok(ServerRespEvent::ChunkACK(ack));
             }
 
             UPLOAD_DONE_TAG => {
@@ -205,6 +208,8 @@ impl ServerFileProcessor {
 }
 
 fn encode_server_resp_event(resp: ServerRespEvent) -> Bytes {
+    info!("encoding resp event: {:?}", resp);
+    
     match resp {
         ServerRespEvent::UploadInitACK(ack) => encode_upload_init_ack(ack),
         ServerRespEvent::ChunkACK(ack) => encode_chunk_ack(ack),

@@ -1,5 +1,5 @@
-use bytes::{Bytes, BytesMut};
-use futures::SinkExt;
+use bytes::{Buf, Bytes, BytesMut};
+use futures::{SinkExt, StreamExt};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
@@ -10,11 +10,8 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    config::MAX_SEND_TASK,
-    errors::SyncError,
-    protocol::{
-        ChunkEvent, FileMeta, UploadDoneEvent, UploadInitEvent, encode_chunk_event,
-        encode_upload_done, encode_upload_init, new_framed_writer,
+    config::MAX_SEND_TASK, errors::SyncError, protocol::{
+        CHUNK_ACK_TAG, ChunkEvent, FileMeta, SRFramedRead, SRFramedWrite, UPLOAD_DONE_ACK_TAG, UPLOAD_INIT_ACK_TAG, UploadDoneACK, UploadDoneEvent, UploadInitACK, UploadInitEvent, decode_chunk_ack, decode_upload_done_ack, decode_upload_init_ack, encode_chunk_event, encode_upload_done, encode_upload_init, new_framed_writer,
     },
 };
 
@@ -73,20 +70,11 @@ impl ClientFileProcessor {
         Ok(chunk_events)
     }
 
-    pub async fn send_chunks(
+    pub async fn send_upload_init(
         &self,
-        stream: TcpStream,
-        chunks: Vec<ChunkEvent>,
-    ) -> Result<(), SyncError> {
-        if chunks.len() == 0 {
-            return Err(SyncError::NoChunks);
-        }
-
-        let (_reader, writer) = stream.into_split();
-        let mut framed_writer = new_framed_writer(writer);
-
-        let (tx, mut rx) = mpsc::channel::<Bytes>(32);
-
+        reader: &mut SRFramedRead,
+        writer: &mut SRFramedWrite,
+    ) -> Result<UploadInitACK, SyncError> {
         let f_meta = &self.meta;
         let upload_event = UploadInitEvent {
             file_id: f_meta.file_id,
@@ -95,61 +83,106 @@ impl ClientFileProcessor {
             name: f_meta.file_name.clone(),
         };
 
+        info!("send upload init...");
+        if let Err(e) = writer.send(encode_upload_init(upload_event)).await {
+            warn!("send upload init failed: {}", e);
+            return Err(SyncError::from(e));
+        }
+
+        if let Some(val) = reader.next().await {
+            match val {
+                Ok(mut bs) => {
+                    let tag = bs.get_u8();
+                    if tag != UPLOAD_INIT_ACK_TAG {
+                        return Err(SyncError::BadChunkData(
+                            "expect upload init ack".to_string(),
+                        ));
+                    }
+                    return Ok(decode_upload_init_ack(&mut bs)?);
+                }
+                Err(e) => return Err(SyncError::StdIOError(e.to_string())),
+            }
+        }
+
+        return Err(SyncError::ServerNoResp);
+    }
+
+    pub async fn send_upload_done(
+        &self,
+        reader: &mut SRFramedRead,
+        writer: &mut SRFramedWrite,
+    ) -> Result<UploadDoneACK, SyncError> {
+        let f_meta = &self.meta;
+
         let done_event = UploadDoneEvent {
             file_id: f_meta.file_id,
         };
 
-        // Writer task: owns `rx` and the framed writer.
-        // Drains every chunk, then writes the done event.
-        let writer_handle = tokio::spawn(async move {
-            info!("send upload init...");
-            if let Err(e) = framed_writer.send(encode_upload_init(upload_event)).await {
-                warn!("send upload init failed: {}", e);
-                return Err(SyncError::from(e));
-            }
+        info!("send upload done event...");
+        if let Err(e) = writer
+            .send(Bytes::from(encode_upload_done(done_event)))
+            .await
+        {
+            warn!("failed to write done_event: {}", e);
+            return Err(SyncError::from(e));
+        }
 
-            info!("send file chunks to server...");
-            while let Some(data) = rx.recv().await {
-                if let Err(e) = framed_writer.send(data).await {
-                    warn!("failed to write chunk to TCP Stream: {}", e);
-                    return Err(SyncError::from(e));
+        if let Some(val) = reader.next().await {
+            match val {
+                Ok(mut bs) => {
+                    let tag = bs.get_u8();
+                    if tag != UPLOAD_DONE_ACK_TAG {
+                        return Err(SyncError::BadChunkData(
+                            "expect upload done ack".to_string(),
+                        ));
+                    }
+                    return Ok(decode_upload_done_ack(&mut bs)?);
                 }
+                Err(e) => return Err(SyncError::StdIOError(e.to_string())),
             }
+        }
 
-            info!("send upload done event...");
-            if let Err(e) = framed_writer
-                .send(Bytes::from(encode_upload_done(done_event)))
-                .await
-            {
-                warn!("failed to write done_event: {}", e);
+        return Err(SyncError::ServerNoResp);
+    }
+
+    pub async fn send_chunks(
+        &self,
+        reader: &mut SRFramedRead,
+        writer: &mut SRFramedWrite,
+        chunks: Vec<ChunkEvent>,
+    ) -> Result<(), SyncError> {
+        if chunks.len() == 0 {
+            return Err(SyncError::NoChunks);
+        }
+
+        for chunk in chunks {
+            let offset = chunk.offset;
+
+            if let Err(e) = writer.send(encode_chunk_event(chunk).into()).await {
+                warn!("failed to write chunk to TCP Stream: {}", e);
                 return Err(SyncError::from(e));
             }
 
-            Ok::<(), SyncError>(())
-        });
+            match reader.next().await {
+                Some(val) => match val {
+                    Ok(mut bs) => {
+                        let tag = bs.get_u8();
+                        if tag != CHUNK_ACK_TAG {
+                            return Err(SyncError::BadChunkData(
+                                "expect chunk ack".to_string(),
+                            ));
+                        }
 
-        let mut join_set = JoinSet::new();
-        for chunk in chunks {
-            if join_set.len() >= MAX_SEND_TASK {
-                join_set.join_next().await;
+                        let ck_ack = decode_chunk_ack(&mut bs)?;
+                        info!("received chunk ack: {:?}", ck_ack);
+                        // assert!(ck_ack.offset == offset);
+                    }
+                    Err(e) => return Err(SyncError::StdIOError(e.to_string())),
+                },
+                None => return Err(SyncError::ServerNoResp),
             }
-
-            let tx_c = tx.clone();
-            join_set.spawn(async move {
-                tx_c.send(encode_chunk_event(chunk).into())
-                    .await
-                    .expect("failed to send item to write channel")
-            });
         }
 
-        // Drop the original sender so the receiver can finish once every clone is gone.
-        drop(tx);
-
-        while let Some(r) = join_set.join_next().await {
-            r.expect("sending chunk task failed");
-        }
-
-        writer_handle.await.expect("writer task panicked")?;
         Ok(())
     }
 }
