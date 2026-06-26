@@ -3,6 +3,12 @@ use thiserror::Error;
 use crate::protocol::ErrMsg;
 
 #[derive(Debug, Error)]
+pub enum SyncClientError {
+    #[error("connect server fail")]
+    ConnectServerFailed,
+}
+
+#[derive(Debug, Error)]
 pub enum SyncError {
     #[error("file size exceed limit: {0}")]
     FileSizeTooLarge(usize),
