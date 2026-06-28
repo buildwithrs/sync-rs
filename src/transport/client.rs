@@ -1,29 +1,53 @@
+use std::collections::HashSet;
+
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, BufReader},
-    net::TcpStream,
-    sync::mpsc,
-    task::JoinSet,
 };
 use tracing::{info, warn};
 
 use crate::{
-    config::MAX_SEND_TASK, errors::SyncError, protocol::{
-        CHUNK_ACK_TAG, ChunkEvent, FileMeta, SRFramedRead, SRFramedWrite, UPLOAD_DONE_ACK_TAG, UPLOAD_INIT_ACK_TAG, UploadDoneACK, UploadDoneEvent, UploadInitACK, UploadInitEvent, decode_chunk_ack, decode_upload_done_ack, decode_upload_init_ack, encode_chunk_event, encode_upload_done, encode_upload_init, new_framed_writer,
+    errors::SyncError,
+    protocol::{
+        CHUNK_ACK_TAG, ChunkEvent, FileMeta, SRFramedRead, SRFramedWrite, UPLOAD_DONE_ACK_TAG,
+        UPLOAD_INIT_ACK_TAG, UploadDoneACK, UploadDoneEvent, UploadInitACK, UploadInitEvent,
+        decode_chunk_ack, decode_upload_done_ack, decode_upload_init_ack, encode_chunk_event,
+        encode_upload_done, encode_upload_init,
     },
 };
 
 #[derive(Debug)]
+pub struct OngoingState {
+    pub upload_offsets: HashSet<u64>,
+}
+
+impl OngoingState {
+    pub fn new() -> Self {
+        Self { upload_offsets: HashSet::new() }
+    }
+
+    pub fn insert_upload_offsets(&mut self, offset: u64) {
+        self.upload_offsets.insert(offset);
+    }
+
+    pub fn remove_acked_offset(&mut self, offset: u64) {
+        self.upload_offsets.remove(&offset);
+    }
+}
+
+#[derive(Debug)]
 pub struct ClientFileProcessor {
     pub meta: FileMeta,
+    pub ongoing: OngoingState,
 }
 
 impl ClientFileProcessor {
     pub fn new(path: &str) -> Self {
         Self {
             meta: FileMeta::new(path),
+            ongoing: OngoingState { upload_offsets: HashSet::new() }
         }
     }
 
@@ -60,6 +84,8 @@ impl ClientFileProcessor {
                 data: Bytes::copy_from_slice(&buf[..n]),
                 offset: offset as u64,
             };
+
+            self.ongoing.insert_upload_offsets(ck.offset);
 
             chunk_events.push(ck);
             offset += n;
@@ -146,7 +172,7 @@ impl ClientFileProcessor {
     }
 
     pub async fn send_chunks(
-        &self,
+        &mut self,
         reader: &mut SRFramedRead,
         writer: &mut SRFramedWrite,
         chunks: Vec<ChunkEvent>,
@@ -156,7 +182,7 @@ impl ClientFileProcessor {
         }
 
         for chunk in chunks {
-            let offset = chunk.offset;
+            self.ongoing.insert_upload_offsets(chunk.offset);
 
             if let Err(e) = writer.send(encode_chunk_event(chunk).into()).await {
                 warn!("failed to write chunk to TCP Stream: {}", e);
@@ -168,14 +194,13 @@ impl ClientFileProcessor {
                     Ok(mut bs) => {
                         let tag = bs.get_u8();
                         if tag != CHUNK_ACK_TAG {
-                            return Err(SyncError::BadChunkData(
-                                "expect chunk ack".to_string(),
-                            ));
+                            return Err(SyncError::BadChunkData("expect chunk ack".to_string()));
                         }
 
                         let ck_ack = decode_chunk_ack(&mut bs)?;
                         info!("received chunk ack: {:?}", ck_ack);
                         // assert!(ck_ack.offset == offset);
+                        self.ongoing.remove_acked_offset(ck_ack.offset);
                     }
                     Err(e) => return Err(SyncError::StdIOError(e.to_string())),
                 },

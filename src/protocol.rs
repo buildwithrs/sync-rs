@@ -335,11 +335,7 @@ pub fn decode_upload_done_ack(bs: &mut BytesMut) -> Result<UploadDoneACK, SyncEr
     let ok = bs.get_u8() != 0;
     let file_id = bytes_to_uid(bs);
     let msg = String::from_utf8_lossy(&bs[16..]).to_string();
-    Ok(UploadDoneACK {
-        file_id,
-        ok,
-        msg,
-    })
+    Ok(UploadDoneACK { file_id, ok, msg })
 }
 
 fn bytes_to_uid(bs: &mut BytesMut) -> Uuid {
@@ -357,10 +353,10 @@ mod tests {
     use crate::protocol::{
         CHUNK_ACK_TAG, CHUNK_TAG, ChunkACK, ChunkEvent, ERR_TAG, ErrMsg, UPLOAD_DONE_ACK_TAG,
         UPLOAD_DONE_TAG, UPLOAD_INIT_ACK_TAG, UploadDoneACK, UploadDoneEvent, UploadInitACK,
-        UploadInitEvent, decode_chunk_ack, decode_chunk_event, decode_error,
-        decode_upload_done, decode_upload_done_ack, decode_upload_init, decode_upload_init_ack,
-        encode_chunk_ack, encode_chunk_event, encode_error, encode_upload_done,
-        encode_upload_done_ack, encode_upload_init, encode_upload_init_ack,
+        UploadInitEvent, decode_chunk_ack, decode_chunk_event, decode_error, decode_upload_done,
+        decode_upload_done_ack, decode_upload_init, decode_upload_init_ack, encode_chunk_ack,
+        encode_chunk_event, encode_error, encode_upload_done, encode_upload_done_ack,
+        encode_upload_init, encode_upload_init_ack,
     };
 
     #[test]

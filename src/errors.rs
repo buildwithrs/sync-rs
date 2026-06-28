@@ -6,8 +6,6 @@ use crate::protocol::ErrMsg;
 pub enum SyncClientError {
     #[error("connect server fail")]
     ConnectServerFailed,
-
-    
 }
 
 #[derive(Debug, Error)]
@@ -59,7 +57,9 @@ impl From<SyncError> for ErrMsg {
             SyncError::DuplicateFile(e) => ErrMsg::new(DUPLICATE_FILE_ERRCODE, &e.to_string()),
             SyncError::FileUploadNotInit(e) => ErrMsg::new(UPLOAD_NOT_INIT_CODE, &e.to_string()),
             SyncError::NoChunks => ErrMsg::new(NO_CHUNKS_CODE, "no file content chunks"),
-            SyncError::UnknownEvent(tag) => ErrMsg::new(UNKOWN_EVENT, &format!("unknown event: {}", tag)),
+            SyncError::UnknownEvent(tag) => {
+                ErrMsg::new(UNKOWN_EVENT, &format!("unknown event: {}", tag))
+            }
             SyncError::ServerNoResp => ErrMsg::new(SERVER_NO_RESP, "server no resp"),
         }
     }

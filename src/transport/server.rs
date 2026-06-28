@@ -17,9 +17,15 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::SERVER_FOLDER, errors::SyncError, protocol::{
-        CHUNK_TAG, ChunkACK, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG, UploadDoneACK, UploadInitACK, decode_chunk_event, decode_upload_done, decode_upload_init, encode_chunk_ack, encode_error, encode_upload_done_ack, encode_upload_init_ack, new_framed_reader, new_framed_writer,
+    config::SERVER_FOLDER,
+    errors::SyncError,
+    protocol::{
+        CHUNK_TAG, ChunkACK, FileMeta, FileUploadState, UPLOAD_DONE_TAG, UPLOAD_INIT_TAG,
+        UploadDoneACK, UploadInitACK, decode_chunk_event, decode_upload_done, decode_upload_init,
+        encode_chunk_ack, encode_error, encode_upload_done_ack, encode_upload_init_ack,
+        new_framed_reader, new_framed_writer,
     },
+    transport::file_hash,
 };
 
 pub type FileDict = Arc<RwLock<HashMap<Uuid, FileMeta>>>;
@@ -97,7 +103,10 @@ impl ServerFileProcessor {
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(f_id, FileUploadState::Init);
 
-                return Ok(ServerRespEvent::UploadInitACK(UploadInitACK { file_id: f_id, offset: 0 }));
+                return Ok(ServerRespEvent::UploadInitACK(UploadInitACK {
+                    file_id: f_id,
+                    offset: 0,
+                }));
             }
 
             CHUNK_TAG => {
@@ -122,13 +131,35 @@ impl ServerFileProcessor {
                 let ev = decode_upload_done(data)?;
                 info!("received upload done for: {}", ev.file_id);
 
+                let f_m = {
+                    let f_meta = self.file_dict.read().await;
+                    match f_meta.get(&ev.file_id) {
+                        Some(m) => Some((m.file_name.clone(), m.file_path.clone(), m.hash.clone())),
+                        None => None,
+                    }
+                };
+
+                if f_m.is_none() {
+                    return Err(SyncError::FileUploadNotInit(ev.file_id.to_string()));
+                }
+
+                let (f_name, fp, f_hash) = f_m.unwrap();
+                let hash = file_hash(&fp).await?;
+                if hash != f_hash.unwrap() {
+                    return Ok(ServerRespEvent::UploadDoneACK(UploadDoneACK {
+                        file_id: ev.file_id,
+                        ok: false,
+                        msg: String::from("file is broken, pls retry"),
+                    }));
+                }
+
                 let mut f_s = self.file_state.write().await;
                 f_s.insert(ev.file_id, FileUploadState::Done);
 
                 return Ok(ServerRespEvent::UploadDoneACK(UploadDoneACK {
                     file_id: ev.file_id,
                     ok: true,
-                    msg: String::new(),
+                    msg: format!("upload success for: {}", f_name),
                 }));
             }
             _ => {
@@ -209,7 +240,7 @@ impl ServerFileProcessor {
 
 fn encode_server_resp_event(resp: ServerRespEvent) -> Bytes {
     info!("encoding resp event: {:?}", resp);
-    
+
     match resp {
         ServerRespEvent::UploadInitACK(ack) => encode_upload_init_ack(ack),
         ServerRespEvent::ChunkACK(ack) => encode_chunk_ack(ack),
